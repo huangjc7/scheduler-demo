@@ -3,17 +3,22 @@ package plugins
 import (
 	"context"
 	"fmt"
+	"github.com/prometheus/client_golang/api"
+	promeV1 "github.com/prometheus/client_golang/api/prometheus/v1"
+	"github.com/prometheus/common/model"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
+	"time"
 )
 
 // settings plugin name
 const (
 	Name              = "sample-plugin"
 	preFilterStateKey = "Prefilter" + Name
+	promtheusURL      = "http://monitor-kube-prometheus-prometheus:9090"
 )
 
 // accomplish preFilter and Filter interfaces
@@ -31,6 +36,7 @@ type SampleArags struct {
 // get plugin configuration args
 func getSampleArgs(object runtime.Object) (*SampleArags, error) {
 	sa := &SampleArags{}
+	// get objecct struct args
 	if err := frameworkruntime.DecodeInto(object, sa); err != nil {
 		return sa, err
 	}
@@ -60,8 +66,36 @@ func getPreFilterState(state *framework.CycleState) (*preFilterState, error) {
 }
 
 type Sample struct {
-	args   *SampleArags
-	handle framework.Handle
+	args             *SampleArags
+	handle           framework.Handle // inherit scheduling framework
+	prometheusClient promeV1.API      //prometheus client
+}
+
+// type PluginFactoryWithFts func(runtime.Object, framework.Handle, plfeature.Features) (framework.Plugin, error)
+func New(object runtime.Object, f framework.Handle) (framework.Plugin, error) {
+	args, err := getSampleArgs(object)
+	if err != nil {
+		return nil, err
+	}
+
+	// init promtheus clinet
+	client, err := api.NewClient(api.Config{
+		Address: promtheusURL,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("creating prometheus client failed: %v", err)
+	}
+
+	//create prometheus API client
+	promeClient := promeV1.NewAPI(client)
+
+	// validata args
+	klog.V(3).Infof("get plugin config args: %+v", args)
+	return &Sample{ //will plugin registry scheduling framework
+		args:             args,
+		handle:           f,
+		prometheusClient: promeClient,
+	}, nil
 }
 
 func (s *Sample) Name() string {
@@ -92,6 +126,21 @@ func (s *Sample) PreFilterExtensions() framework.PreFilterExtensions {
 
 // FilterPlugin interface member
 func (s *Sample) Filter(ctx context.Context, state *framework.CycleState, pod *v1.Pod, nodeInfo *framework.NodeInfo) *framework.Status {
+	//query prometheus get cpu rate
+	// 查询 Prometheus 获取节点的 CPU 使用率
+	cpuUsage, err := s.queryNodeCPUUsage(ctx, nodeInfo.Node().Name)
+	if err != nil {
+		return framework.NewStatus(framework.Error, err.Error())
+	}
+
+	// 定义 CPU 使用率的阈值
+	const maxAllowedCPUUsage = 0.7 // 70%
+
+	// 如果节点的 CPU 使用率超过阈值，则不调度 Pod 到该节点
+	if cpuUsage > maxAllowedCPUUsage {
+		return framework.NewStatus(framework.Unschedulable, fmt.Sprintf("node's CPU usage is too high: %.2f", cpuUsage))
+	}
+
 	preState, err := getPreFilterState(state)
 	if err != nil {
 		return framework.NewStatus(framework.Error, err.Error())
@@ -101,16 +150,25 @@ func (s *Sample) Filter(ctx context.Context, state *framework.CycleState, pod *v
 	return framework.NewStatus(framework.Success)
 }
 
-// type PluginFactoryWithFts func(runtime.Object, framework.Handle, plfeature.Features) (framework.Plugin, error)
-func New(object runtime.Object, f framework.Handle) (framework.Plugin, error) {
-	args, err := getSampleArgs(object)
+func (s *Sample) queryNodeCPUUsage(ctx context.Context, nodeName string) (float64, error) {
+	// 构建 Prometheus 查询
+	query := fmt.Sprintf("rate(node_cpu_seconds_total{mode='idle',instance='%s'}[1m])", nodeName)
+	val, _, err := s.prometheusClient.Query(ctx, query, time.Now())
 	if err != nil {
-		return nil, err
+		return 0, fmt.Errorf("querying Prometheus failed: %v", err)
 	}
-	// validata args
-	klog.V(3).Infof("get plugin config args: %+v", args)
-	return &Sample{
-		args:   args,
-		handle: f,
-	}, nil
+
+	// 解析查询结果
+	vec, ok := val.(model.Vector)
+	if !ok || len(vec) == 0 {
+		return 0, fmt.Errorf("invalid Prometheus response")
+	}
+
+	// 获取 CPU 空闲率
+	idleCPU := float64(vec[0].Value)
+
+	// CPU 使用率为 1 减去 CPU 空闲率
+	cpuUsage := 1 - idleCPU
+
+	return cpuUsage, nil
 }
