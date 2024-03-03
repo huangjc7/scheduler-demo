@@ -11,6 +11,7 @@ import (
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
+	"log"
 	"time"
 )
 
@@ -18,7 +19,7 @@ import (
 const (
 	Name              = "sample-plugin"
 	preFilterStateKey = "Prefilter" + Name
-	promtheusURL      = "http://monitor-kube-prometheus-prometheus:9090"
+	promtheusURL      = "http://192.168.126.129:31580"
 )
 
 // accomplish preFilter and Filter interfaces
@@ -152,7 +153,8 @@ func (s *Sample) Filter(ctx context.Context, state *framework.CycleState, pod *v
 
 func (s *Sample) queryNodeCPUUsage(ctx context.Context, nodeName string) (float64, error) {
 	// 构建 Prometheus 查询
-	query := fmt.Sprintf("rate(node_cpu_seconds_total{mode='idle',instance='%s'}[1m])", nodeName)
+	query := fmt.Sprintf("rate(node_cpu_seconds_total{mode='idle',node='%s'}[1m])", nodeName)
+	log.Println("Query promQL", query)
 	val, _, err := s.prometheusClient.Query(ctx, query, time.Now())
 	if err != nil {
 		return 0, fmt.Errorf("querying Prometheus failed: %v", err)
